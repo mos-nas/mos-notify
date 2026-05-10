@@ -2,6 +2,7 @@ package main
 
 import (
   "bytes"
+  "crypto/tls"
   "encoding/json"
   "flag"
   "fmt"
@@ -9,6 +10,7 @@ import (
   "log"
   "net"
   "net/http"
+  "net/smtp"
   "net/url"
   "os"
   "path/filepath"
@@ -43,6 +45,20 @@ type ProviderConfig struct {
   ColorPrio    interface{}            `json:"color_prio"`
 }
 
+type EmailConfig struct {
+  Enabled      bool                   `json:"enabled"`
+  SmtpHost     string                 `json:"smtp_host"`
+  SmtpPort     int                    `json:"smtp_port"`
+  SmtpTLS      bool                   `json:"smtp_tls"`
+  SmtpUser     string                 `json:"smtp_user"`
+  SmtpPassword string                 `json:"smtp_password"`
+  From         string                 `json:"from"`
+  To           []string               `json:"to"`
+  Subject      string                 `json:"subject"`
+  Body         string                 `json:"body"`
+  AlertMapping map[string]interface{} `json:"alert_mapping"`
+}
+
 type AppConfig struct {
   HttpPort int `json:"http_port"`
   WsPort   int `json:"ws_port"`
@@ -55,6 +71,7 @@ var (
 	clientsMutex  sync.RWMutex
 	broadcast     = make(chan Message, 100)
 	providers     = make(map[string]ProviderConfig)
+	emailCfg      *EmailConfig
 	appcfg        = AppConfig{HttpPort: 999, WsPort: 999}
 	fileMutex     = sync.Mutex{}
 	logFilePath   = "/var/mos/notify/notifications.json"
@@ -76,11 +93,18 @@ func main() {
   if err != nil {
     log.Printf("Warning: Could not load provider config: %v", err)
   }
-  if len(cfgs) == 0 {
+
+  // Load email config separately
+  if ec, err := loadEmailConfig("/boot/config/notify/providers/email.json"); err == nil {
+    emailCfg = ec
+  } else if !os.IsNotExist(err) {
+    log.Printf("Warning: Could not load email config: %v", err)
+  }
+
+  if len(cfgs) == 0 && emailCfg == nil {
     log.Println("No providers configured - running in WebSocket-only mode")
   } else {
     providers = cfgs
-    // Display overview
     fmt.Println("Providers loaded:")
     for name, cfg := range providers {
       state := "enabled"
@@ -88,6 +112,13 @@ func main() {
         state = "disabled"
       }
       fmt.Printf("  - %s (%s)\n", name, state)
+    }
+    if emailCfg != nil {
+      state := "enabled"
+      if !emailCfg.Enabled {
+        state = "disabled"
+      }
+      fmt.Printf("  - email (%s)\n", state)
     }
   }
 
@@ -247,6 +278,10 @@ func handleMessages() {
 			}
 			go sendToProvider(name, cfg, msg)
 		}
+		// Send email if configured and enabled
+		if emailCfg != nil && emailCfg.Enabled {
+			go sendEmail(*emailCfg, msg)
+		}
 		// Write to file
 		go writeMessageToFile(msg)
 	}
@@ -319,7 +354,7 @@ func loadAppConfig(path string) error {
   return json.Unmarshal(data, &appcfg)
 }
 
-// Config loader for providers
+// Config loader for providers (skips email.json which is handled separately)
 func loadProviderConfigs(dir string) (map[string]ProviderConfig, error) {
   configs := make(map[string]ProviderConfig)
   files, err := os.ReadDir(dir)
@@ -327,19 +362,165 @@ func loadProviderConfigs(dir string) (map[string]ProviderConfig, error) {
     return nil, err
   }
   for _, f := range files {
-    if !f.IsDir() && strings.HasSuffix(f.Name(), ".json") {
-      data, err := os.ReadFile(filepath.Join(dir, f.Name()))
-      if err != nil {
-        return nil, fmt.Errorf("Config-Fehler %s: %v", f.Name(), err)
-      }
-      var cfg ProviderConfig
-      if err := json.Unmarshal(data, &cfg); err != nil {
-        return nil, fmt.Errorf("Config-Fehler %s: %v", f.Name(), err)
-      }
-      configs[strings.TrimSuffix(f.Name(), ".json")] = cfg
+    if f.IsDir() || !strings.HasSuffix(f.Name(), ".json") {
+      continue
     }
+    if f.Name() == "email.json" {
+      continue
+    }
+    data, err := os.ReadFile(filepath.Join(dir, f.Name()))
+    if err != nil {
+      return nil, fmt.Errorf("Config-Fehler %s: %v", f.Name(), err)
+    }
+    var cfg ProviderConfig
+    if err := json.Unmarshal(data, &cfg); err != nil {
+      return nil, fmt.Errorf("Config-Fehler %s: %v", f.Name(), err)
+    }
+    configs[strings.TrimSuffix(f.Name(), ".json")] = cfg
   }
   return configs, nil
+}
+
+// Config loader for email provider
+func loadEmailConfig(filePath string) (*EmailConfig, error) {
+  data, err := os.ReadFile(filePath)
+  if err != nil {
+    return nil, err
+  }
+  var cfg EmailConfig
+  if err := json.Unmarshal(data, &cfg); err != nil {
+    return nil, fmt.Errorf("email.json parse error: %v", err)
+  }
+  return &cfg, nil
+}
+
+// Email send function
+func sendEmail(cfg EmailConfig, msg Message) {
+  mapped := msg.Priority
+  if cfg.AlertMapping != nil {
+    if val, ok := cfg.AlertMapping[msg.Priority]; ok {
+      mapped = fmt.Sprintf("%v", val)
+    }
+  }
+
+  data := map[string]string{
+    "Title":    msg.Title,
+    "Message":  msg.Message,
+    "Priority": mapped,
+    "Time":     msg.Timestamp,
+  }
+
+  subject := renderTemplate(cfg.Subject, data)
+  body := renderTemplate(cfg.Body, data)
+
+  toHeader := strings.Join(cfg.To, ", ")
+  mime := fmt.Sprintf("From: %s\r\nTo: %s\r\nSubject: %s\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=\"UTF-8\"\r\n\r\n%s",
+    cfg.From, toHeader, subject, body)
+
+  addr := fmt.Sprintf("%s:%d", cfg.SmtpHost, cfg.SmtpPort)
+
+  var auth smtp.Auth
+  if cfg.SmtpUser != "" {
+    auth = smtp.PlainAuth("", cfg.SmtpUser, cfg.SmtpPassword, cfg.SmtpHost)
+  }
+
+  if cfg.SmtpPort == 465 {
+    // Implicit TLS (SMTPS)
+    tlsConfig := &tls.Config{ServerName: cfg.SmtpHost}
+    conn, err := tls.Dial("tcp", addr, tlsConfig)
+    if err != nil {
+      log.Printf("[email] TLS connection failed: %v", err)
+      return
+    }
+    defer conn.Close()
+
+    client, err := smtp.NewClient(conn, cfg.SmtpHost)
+    if err != nil {
+      log.Printf("[email] SMTP client error: %v", err)
+      return
+    }
+    defer client.Quit()
+
+    if auth != nil {
+      if err := client.Auth(auth); err != nil {
+        log.Printf("[email] Auth failed: %v", err)
+        return
+      }
+    }
+    if err := client.Mail(cfg.From); err != nil {
+      log.Printf("[email] MAIL FROM failed: %v", err)
+      return
+    }
+    for _, rcpt := range cfg.To {
+      if err := client.Rcpt(rcpt); err != nil {
+        log.Printf("[email] RCPT TO <%s> failed: %v", rcpt, err)
+        return
+      }
+    }
+    w, err := client.Data()
+    if err != nil {
+      log.Printf("[email] DATA failed: %v", err)
+      return
+    }
+    _, err = w.Write([]byte(mime))
+    if err != nil {
+      log.Printf("[email] Write failed: %v", err)
+      return
+    }
+    w.Close()
+  } else if cfg.SmtpTLS {
+    // STARTTLS (typically port 587)
+    client, err := smtp.Dial(addr)
+    if err != nil {
+      log.Printf("[email] Dial failed: %v", err)
+      return
+    }
+    defer client.Quit()
+
+    tlsConfig := &tls.Config{ServerName: cfg.SmtpHost}
+    if err := client.StartTLS(tlsConfig); err != nil {
+      log.Printf("[email] STARTTLS failed: %v", err)
+      return
+    }
+    if auth != nil {
+      if err := client.Auth(auth); err != nil {
+        log.Printf("[email] Auth failed: %v", err)
+        return
+      }
+    }
+    if err := client.Mail(cfg.From); err != nil {
+      log.Printf("[email] MAIL FROM failed: %v", err)
+      return
+    }
+    for _, rcpt := range cfg.To {
+      if err := client.Rcpt(rcpt); err != nil {
+        log.Printf("[email] RCPT TO <%s> failed: %v", rcpt, err)
+        return
+      }
+    }
+    w, err := client.Data()
+    if err != nil {
+      log.Printf("[email] DATA failed: %v", err)
+      return
+    }
+    _, err = w.Write([]byte(mime))
+    if err != nil {
+      log.Printf("[email] Write failed: %v", err)
+      return
+    }
+    w.Close()
+  } else {
+    // Plain SMTP (no TLS)
+    err := smtp.SendMail(addr, auth, cfg.From, cfg.To, []byte(mime))
+    if err != nil {
+      log.Printf("[email] SendMail failed: %v", err)
+      return
+    }
+  }
+
+  if verbose {
+    log.Printf("[email] Sent to %s (subject: %s)", toHeader, subject)
+  }
 }
 
 // Provider send function
