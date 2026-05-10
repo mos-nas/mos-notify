@@ -396,6 +396,16 @@ func loadEmailConfig(filePath string) (*EmailConfig, error) {
 
 // Email send function
 func sendEmail(cfg EmailConfig, msg Message) {
+  if cfg.SmtpHost == "" || cfg.From == "" || len(cfg.To) == 0 {
+    if verbose {
+      log.Printf("[email] Skipped: missing smtp_host, from, or to")
+    }
+    return
+  }
+  if cfg.SmtpPort == 0 {
+    cfg.SmtpPort = 587
+  }
+
   mapped := msg.Priority
   if cfg.AlertMapping != nil {
     if val, ok := cfg.AlertMapping[msg.Priority]; ok {
@@ -525,6 +535,16 @@ func sendEmail(cfg EmailConfig, msg Message) {
 
 // Provider send function
 func sendToProvider(name string, cfg ProviderConfig, msg Message) {
+  if cfg.Url == "" {
+    if verbose {
+      log.Printf("[%s] Skipped: empty URL", name)
+    }
+    return
+  }
+  if cfg.Method == "" {
+    cfg.Method = "POST"
+  }
+
   mapped := msg.Priority
   if cfg.AlertMapping != nil {
     if val, ok := cfg.AlertMapping[msg.Priority]; ok {
