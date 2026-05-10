@@ -3,6 +3,7 @@ package main
 import (
   "bytes"
   "encoding/json"
+  "flag"
   "fmt"
   "io"
   "log"
@@ -57,10 +58,14 @@ var (
 	appcfg        = AppConfig{HttpPort: 999, WsPort: 999}
 	fileMutex     = sync.Mutex{}
 	logFilePath   = "/var/mos/notify/notifications.json"
+	verbose       bool
 )
 
 // Main
 func main() {
+  flag.BoolVar(&verbose, "verbose", false, "Enable verbose logging for provider requests")
+  flag.Parse()
+
   // Load ports.json
   if err := loadAppConfig("/boot/config/notify/ports.json"); err != nil {
     log.Printf("Couldn't load ports.json, using default ports: 999")
@@ -159,8 +164,9 @@ func handleUnixSocketConnection(conn net.Conn) {
     return
   }
 
-  // Just for debugging
-  //log.Printf("Socket message: %s", messageText)
+  if verbose {
+    log.Printf("Socket message: %s", messageText)
+  }
 
   // Try to parse JSON, if fail then handle as text
   var msg Message
@@ -354,27 +360,43 @@ func sendToProvider(name string, cfg ProviderConfig, msg Message) {
   if ct, ok := cfg.Headers["Content-Type"]; ok && strings.Contains(ct, "json") {
     b, _ := json.Marshal(result)
     reqBody = bytes.NewBuffer(b)
+    if verbose {
+      log.Printf("[%s] Request body: %s", name, string(b))
+    }
   } else {
     form := url.Values{}
     for k, v := range result {
       form.Set(k, fmt.Sprintf("%v", v))
     }
     reqBody = strings.NewReader(form.Encode())
+    if verbose {
+      log.Printf("[%s] Request body (form): %s", name, form.Encode())
+    }
   }
   finalURL := renderTemplate(cfg.Url, data)
-  req, _ := http.NewRequest(cfg.Method, finalURL, reqBody)
+  req, err := http.NewRequest(cfg.Method, finalURL, reqBody)
+  if err != nil {
+    log.Printf("[%s] Error creating request: %v", name, err)
+    return
+  }
   for k, v := range cfg.Headers {
-    req.Header.Set(k, v)
+    req.Header.Set(k, renderTemplate(v, data))
+  }
+  if verbose {
+    log.Printf("[%s] %s %s", name, cfg.Method, finalURL)
   }
   resp, err := http.DefaultClient.Do(req)
   if err != nil {
-    // Just for debugging
-    //log.Printf("✗ %s Error: %v", name, err)
+    log.Printf("[%s] Request failed: %v", name, err)
     return
   }
   defer resp.Body.Close()
-  // Just for debugging
-  //log.Printf("✓ Provider %s → %s", name, resp.Status)
+  if resp.StatusCode >= 400 {
+    respBody, _ := io.ReadAll(resp.Body)
+    log.Printf("[%s] Provider returned %s: %s", name, resp.Status, string(respBody))
+  } else if verbose {
+    log.Printf("[%s] Success: %s", name, resp.Status)
+  }
 }
 
 // Helper
