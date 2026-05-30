@@ -147,7 +147,7 @@ func startUnixSocketServer() {
 
   // Create Socket path, shouldn't be necessary but just in case
   if err := os.MkdirAll("/run", 0755); err != nil {
-    log.Printf("Konnte Socket-Verzeichnis nicht erstellen: %v", err)
+    log.Printf("Error creating Socket directory: %v", err)
     return
   }
 
