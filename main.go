@@ -59,6 +59,13 @@ type EmailConfig struct {
   AlertMapping map[string]interface{} `json:"alert_mapping"`
 }
 
+// Listen config
+type AppConfig struct {
+  ListenTCP bool `json:"listen_tcp"`
+  HttpPort  int  `json:"http_port"`
+  WsPort    int  `json:"ws_port"`
+}
+
 // Global vars
 var (
 	upgrader      = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
@@ -67,6 +74,7 @@ var (
 	broadcast     = make(chan Message, 100)
 	providers     = make(map[string]ProviderConfig)
 	emailCfg      *EmailConfig
+	appcfg        = AppConfig{ListenTCP: false, HttpPort: 999, WsPort: 999}
 	fileMutex     = sync.Mutex{}
 	logFilePath   = "/var/mos/notify/notifications.json"
 	verbose       bool
@@ -76,6 +84,11 @@ var (
 func main() {
   flag.BoolVar(&verbose, "verbose", false, "Enable verbose logging for provider requests")
   flag.Parse()
+
+  // Load listen config, on error socket only
+  if err := loadAppConfig("/boot/config/notify/ports.json"); err != nil {
+    log.Printf("No usable ports.json - TCP disabled, using Unix socket only")
+  }
 
   // Load providers
   cfgs, err := loadProviderConfigs("/boot/config/notify/providers")
@@ -122,6 +135,14 @@ func main() {
   go startUnixSocketServer()
 
   // Socket Server
+  if appcfg.ListenTCP {
+    listenTCP(appcfg.HttpPort)
+    if appcfg.WsPort != appcfg.HttpPort {
+      listenTCP(appcfg.WsPort)
+    }
+  }
+
+  // HTTP/WebSocket server on the Unix socket, socket is always enabled
   serverSocketPath := "/run/mos-notify-server.sock"
   os.Remove(serverSocketPath)
   serverListener, err := net.Listen("unix", serverSocketPath)
@@ -130,11 +151,38 @@ func main() {
   }
   os.Chmod(serverSocketPath, 0666)
 
-  fmt.Println("Server starting (Unix sockets only)")
+  fmt.Println("Server starting")
   fmt.Printf(" - HTTP/WebSocket: unix:%s (/ws, /send)\n", serverSocketPath)
   fmt.Printf(" - Ingest (raw):   unix:/run/mos-notify.sock\n")
+  if appcfg.ListenTCP {
+    if appcfg.WsPort != appcfg.HttpPort {
+      fmt.Printf(" - TCP: :%d and :%d (/ws, /send)\n", appcfg.HttpPort, appcfg.WsPort)
+    } else {
+      fmt.Printf(" - TCP: :%d (/ws, /send)\n", appcfg.HttpPort)
+    }
+  }
 
   log.Fatal(http.Serve(serverListener, nil))
+}
+
+// Both /ws and /send are served if enabled on the given ports
+func listenTCP(port int) {
+  go func(p int) {
+    addr := fmt.Sprintf(":%d", p)
+    log.Printf("HTTP/WebSocket also on TCP %s", addr)
+    if err := http.ListenAndServe(addr, nil); err != nil {
+      log.Fatalf("TCP listen error on %s: %v", addr, err)
+    }
+  }(port)
+}
+
+// Config loader for listen settings
+func loadAppConfig(path string) error {
+  data, err := os.ReadFile(path)
+  if err != nil {
+    return err
+  }
+  return json.Unmarshal(data, &appcfg)
 }
 
 // Socket Server
