@@ -59,11 +59,6 @@ type EmailConfig struct {
   AlertMapping map[string]interface{} `json:"alert_mapping"`
 }
 
-type AppConfig struct {
-  HttpPort int `json:"http_port"`
-  WsPort   int `json:"ws_port"`
-}
-
 // Global vars
 var (
 	upgrader      = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
@@ -72,7 +67,6 @@ var (
 	broadcast     = make(chan Message, 100)
 	providers     = make(map[string]ProviderConfig)
 	emailCfg      *EmailConfig
-	appcfg        = AppConfig{HttpPort: 999, WsPort: 999}
 	fileMutex     = sync.Mutex{}
 	logFilePath   = "/var/mos/notify/notifications.json"
 	verbose       bool
@@ -82,11 +76,6 @@ var (
 func main() {
   flag.BoolVar(&verbose, "verbose", false, "Enable verbose logging for provider requests")
   flag.Parse()
-
-  // Load ports.json
-  if err := loadAppConfig("/boot/config/notify/ports.json"); err != nil {
-    log.Printf("Couldn't load ports.json, using default ports: 999")
-  }
 
   // Load providers
   cfgs, err := loadProviderConfigs("/boot/config/notify/providers")
@@ -132,13 +121,20 @@ func main() {
   // Run Unix Socket Server
   go startUnixSocketServer()
 
-  addr := fmt.Sprintf(":%d", appcfg.HttpPort)
-  fmt.Printf("Server start on port: %d\n", appcfg.HttpPort)
-  fmt.Printf(" - WebSocket: ws://localhost:%d/ws\n", appcfg.WsPort)
-  fmt.Printf(" - Send:    POST http://localhost:%d/send\n", appcfg.HttpPort)
-  fmt.Printf(" - Socket:  echo 'Message' | /var/run/sock/mos-notify.sock\n")
+  // Socket Server
+  serverSocketPath := "/run/mos-notify-server.sock"
+  os.Remove(serverSocketPath)
+  serverListener, err := net.Listen("unix", serverSocketPath)
+  if err != nil {
+    log.Fatalf("Error creating server socket: %v", err)
+  }
+  os.Chmod(serverSocketPath, 0666)
 
-  log.Fatal(http.ListenAndServe(addr, nil))
+  fmt.Println("Server starting (Unix sockets only)")
+  fmt.Printf(" - HTTP/WebSocket: unix:%s (/ws, /send)\n", serverSocketPath)
+  fmt.Printf(" - Ingest (raw):   unix:/run/mos-notify.sock\n")
+
+  log.Fatal(http.Serve(serverListener, nil))
 }
 
 // Socket Server
@@ -343,15 +339,6 @@ func validateAndFixMessage(msg *Message) bool {
     }
   }
   return true
-}
-
-// Config loader
-func loadAppConfig(path string) error {
-  data, err := os.ReadFile(path)
-  if err != nil {
-    return err
-  }
-  return json.Unmarshal(data, &appcfg)
 }
 
 // Config loader for providers (skips email.json which is handled separately)
