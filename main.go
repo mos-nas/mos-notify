@@ -43,6 +43,7 @@ type ProviderConfig struct {
   Body         map[string]interface{} `json:"body"`
   AlertMapping map[string]interface{} `json:"alert_mapping"`
   ColorPrio    interface{}            `json:"color_prio"`
+  Levels       interface{}            `json:"levels"`
 }
 
 type EmailConfig struct {
@@ -57,6 +58,7 @@ type EmailConfig struct {
   Subject      string                 `json:"subject"`
   Body         string                 `json:"body"`
   AlertMapping map[string]interface{} `json:"alert_mapping"`
+  Levels       interface{}            `json:"levels"`
 }
 
 // Listen config
@@ -295,6 +297,12 @@ func handleMessages() {
 	for {
 		msg := <-broadcast
 
+		// always_push bypasses provider level filters, then continues as normal message
+		alwaysPush := strings.EqualFold(strings.TrimSpace(msg.Priority), ALWAYS_PUSH)
+		if alwaysPush {
+			msg.Priority = "normal"
+		}
+
 		// Send to WebSocket - collect failed clients first
 		var failedClients []*websocket.Conn
 		clientsMutex.RLock()
@@ -320,11 +328,21 @@ func handleMessages() {
 			if !cfg.Enabled {
 				continue
 			}
+			if !alwaysPush && !levelAllowed(cfg.Levels, msg.Priority) {
+				if verbose {
+					log.Printf("[%s] Skipped: priority '%s' not in configured levels", name, msg.Priority)
+				}
+				continue
+			}
 			go sendToProvider(name, cfg, msg)
 		}
 		// Send email if configured and enabled
 		if emailCfg != nil && emailCfg.Enabled {
-			go sendEmail(*emailCfg, msg)
+			if alwaysPush || levelAllowed(emailCfg.Levels, msg.Priority) {
+				go sendEmail(*emailCfg, msg)
+			} else if verbose {
+				log.Printf("[email] Skipped: priority '%s' not in configured levels", msg.Priority)
+			}
 		}
 		// Write to file
 		go writeMessageToFile(msg)
@@ -432,6 +450,32 @@ func loadEmailConfig(filePath string) (*EmailConfig, error) {
     return nil, fmt.Errorf("email.json parse error: %v", err)
   }
   return &cfg, nil
+}
+
+// Message priority that bypasses provider level filters
+const (
+  ALWAYS_PUSH = "always_push"
+)
+
+// Returns true if the message priority is allowed for a provider.
+// If levels is not set (empty), normal, warning, and alert are allowed by default,
+// but info is excluded (info only goes to WebSocket and internal log by default).
+func levelAllowed(levels interface{}, priority string) bool {
+  var list []interface{}
+  if arr, ok := levels.([]interface{}); ok {
+    list = arr
+  }
+  if len(list) == 0 {
+    // Default: allow normal, warning, alert but not info
+    p := strings.TrimSpace(strings.ToLower(priority))
+    return p == "normal" || p == "warning" || p == "alert"
+  }
+  for _, l := range list {
+    if strings.EqualFold(strings.TrimSpace(fmt.Sprintf("%v", l)), strings.TrimSpace(priority)) {
+      return true
+    }
+  }
+  return false
 }
 
 // Email send function
