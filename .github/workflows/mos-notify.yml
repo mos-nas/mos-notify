@@ -32,7 +32,7 @@ jobs:
         PACKAGEDIR=$BUILDDIR/mos-notify_package
         mkdir -p $PACKAGEDIR/DEBIAN $PACKAGEDIR/usr/bin $PACKAGEDIR/usr/share/doc/mos-notify $PACKAGEDIR/var/mos/notify
 
-        go build -ldflags="-s -w" -o mos-notify
+        GOAMD64=v1 go build -ldflags="-s -w" -o mos-notify
 
         mv $BUILDDIR/mos-notify $PACKAGEDIR/usr/bin/mos-notify
 
