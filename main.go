@@ -2,7 +2,11 @@ package main
 
 import (
   "bytes"
+  "crypto/hmac"
+  "crypto/sha256"
   "crypto/tls"
+  "encoding/base64"
+  "encoding/hex"
   "encoding/json"
   "flag"
   "fmt"
@@ -80,6 +84,10 @@ var (
 	fileMutex     = sync.Mutex{}
 	logFilePath   = "/var/mos/notify/notifications.json"
 	verbose       bool
+	apiEnvPath    = "/boot/config/api/.env"
+	jwtSecret     []byte
+	jwtSecretLock sync.Mutex
+	lastRejectLog time.Time
 )
 
 // Main
@@ -126,9 +134,11 @@ func main() {
     }
   }
 
-  // Routes for receiving messages
+  // WebSocket route
   http.HandleFunc("/ws", handleConnections)
-  http.HandleFunc("/send", handleSend)
+
+  // JWT secret for WS ticket validation (retries every 5s)
+  go secretLoader()
 
   // Run dispatcher
   go handleMessages()
@@ -154,20 +164,20 @@ func main() {
   os.Chmod(serverSocketPath, 0666)
 
   fmt.Println("Server starting")
-  fmt.Printf(" - HTTP/WebSocket: unix:%s (/ws, /send)\n", serverSocketPath)
-  fmt.Printf(" - Ingest (raw):   unix:/run/mos-notify.sock\n")
+  fmt.Printf(" - WebSocket: unix:%s (/ws, ticket required)\n", serverSocketPath)
+  fmt.Printf(" - Ingest (raw): unix:/run/mos-notify.sock\n")
   if appcfg.ListenTCP {
     if appcfg.WsPort != appcfg.HttpPort {
-      fmt.Printf(" - TCP: :%d and :%d (/ws, /send)\n", appcfg.HttpPort, appcfg.WsPort)
+      fmt.Printf(" - TCP: :%d and :%d (/ws)\n", appcfg.HttpPort, appcfg.WsPort)
     } else {
-      fmt.Printf(" - TCP: :%d (/ws, /send)\n", appcfg.HttpPort)
+      fmt.Printf(" - TCP: :%d (/ws)\n", appcfg.HttpPort)
     }
   }
 
   log.Fatal(http.Serve(serverListener, nil))
 }
 
-// Both /ws and /send are served if enabled on the given ports
+// /ws is served if enabled on the given ports
 func listenTCP(port int) {
   go func(p int) {
     addr := fmt.Sprintf(":%d", p)
@@ -267,8 +277,99 @@ func handleUnixSocketConnection(conn net.Conn) {
   }
 }
 
+// JWT secret handling
+func loadJwtSecret() []byte {
+  data, err := os.ReadFile(apiEnvPath)
+  if err != nil {
+    return nil
+  }
+  for _, line := range strings.Split(string(data), "\n") {
+    line = strings.TrimSpace(line)
+    if strings.HasPrefix(line, "JWT_SECRET=") {
+      val := strings.Trim(line[len("JWT_SECRET="):], "\"' \t")
+      if val != "" {
+        return []byte(val)
+      }
+    }
+  }
+  return nil
+}
+
+func getJwtSecret() []byte {
+  jwtSecretLock.Lock()
+  defer jwtSecretLock.Unlock()
+  return jwtSecret
+}
+
+// Retries every 5s until the secret is found
+func secretLoader() {
+  for {
+    if s := loadJwtSecret(); len(s) > 0 {
+      jwtSecretLock.Lock()
+      jwtSecret = s
+      jwtSecretLock.Unlock()
+      log.Println("JWT secret loaded - WS ticket validation active")
+      return
+    }
+    time.Sleep(5 * time.Second)
+  }
+}
+
+// WsTicket: "base64url(payload).hex(hmac-sha256(payload, JWT_SECRET))"
+func validateWsTicket(ticket string, secret []byte) bool {
+  if ticket == "" || len(secret) == 0 {
+    return false
+  }
+  dot := strings.IndexByte(ticket, '.')
+  if dot <= 0 {
+    return false
+  }
+  payload, sig := ticket[:dot], ticket[dot+1:]
+
+  mac := hmac.New(sha256.New, secret)
+  mac.Write([]byte(payload))
+  if !hmac.Equal([]byte(sig), []byte(hex.EncodeToString(mac.Sum(nil)))) {
+    return false
+  }
+
+  raw, err := base64.RawURLEncoding.DecodeString(payload)
+  if err != nil {
+    return false
+  }
+  var claims struct {
+    Iat  int64  `json:"iat"`
+    Exp  int64  `json:"exp"`
+    Uid  string `json:"uid"`
+    Role string `json:"role"`
+  }
+  if err := json.Unmarshal(raw, &claims); err != nil {
+    return false
+  }
+  return claims.Exp > time.Now().Unix()
+}
+
+// Throttled rejection logging
+func shouldLogRejection() bool {
+  jwtSecretLock.Lock()
+  defer jwtSecretLock.Unlock()
+  if time.Since(lastRejectLog) >= 5*time.Second {
+    lastRejectLog = time.Now()
+    return true
+  }
+  return false
+}
+
 // WebSocket
 func handleConnections(w http.ResponseWriter, r *http.Request) {
+	ticket := r.URL.Query().Get("ticket")
+	if !validateWsTicket(ticket, getJwtSecret()) {
+		if shouldLogRejection() {
+			log.Printf("WS rejected: invalid or expired ticket from %s (further rejections logged at most every 5s)", r.RemoteAddr)
+		}
+		http.Error(w, "Invalid or expired ticket", http.StatusUnauthorized)
+		return
+	}
+
 	ws, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("Upgrade error: %v", err)
@@ -347,33 +448,6 @@ func handleMessages() {
 		// Write to file
 		go writeMessageToFile(msg)
 	}
-}
-
-// HTTP /send
-func handleSend(w http.ResponseWriter, r *http.Request) {
-  body, _ := io.ReadAll(r.Body)
-  defer r.Body.Close()
-  var msg Message
-  // Try to parse JSON, if fail then handle as text
-  if strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
-    if err := json.Unmarshal(body, &msg); err != nil {
-      http.Error(w, "Invalid JSON", 400)
-      return
-    }
-  } else {
-    msg = Message{
-      Title:    "",
-      Message:  string(body),
-      Priority: "normal",
-    }
-  }
-
-  // Validate and send on broadcast or fail silently
-  if validateAndFixMessage(&msg) {
-    broadcast <- msg
-    // Just for troubleshooting
-    //conn.Write([]byte("ok\n"))
-  }
 }
 
 // Message validation
