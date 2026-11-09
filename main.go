@@ -84,7 +84,7 @@ var (
 	fileMutex     = sync.Mutex{}
 	logFilePath   = "/var/mos/notify/notifications.json"
 	verbose       bool
-	apiEnvPath    = "/boot/config/api/.env"
+	apiEnvPath    = "/boot/config/api/env"
 	jwtSecret     []byte
 	jwtSecretLock sync.Mutex
 	lastRejectLog time.Time
